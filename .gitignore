@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.sqlite
+*.db
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+
+# Local testing and demo web app (not pushed to GitHub)
+web/
+tests/
+scripts/test_client.py
+scripts/copy_all_skills.py

@@ -1,0 +1,8 @@
+# Cursor Rules: Skills Hub Integration
+
+This workspace integrates with the `skills-hub` MCP server.
+
+- When assisting with specific domain tasks (API design, SQL optimization, Docker, security, testing), query the `skills-hub` MCP tools:
+  - `search_skills(query)`
+  - `get_skill(skill_name, section="checklist")`
+- Do not dump full documentation into chat; extract and apply only actionable items.

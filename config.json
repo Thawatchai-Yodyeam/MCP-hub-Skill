@@ -1,0 +1,6 @@
+{
+  "skills_directory": "skills",
+  "search_limit": 5,
+  "max_description_length": 150,
+  "token_saver_directive": true
+}

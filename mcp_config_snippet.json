@@ -1,0 +1,12 @@
+{
+  "skills-hub": {
+    "command": "C:\\Python314\\python.exe",
+    "args": [
+      "d:\\MCP-hub-Skilll\\server.py"
+    ],
+    "env": {
+      "PYTHONUNBUFFERED": "1",
+      "SKILLS_DIR": "d:\\MCP-hub-Skilll\\skills"
+    }
+  }
+}

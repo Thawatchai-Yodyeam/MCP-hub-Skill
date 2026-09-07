@@ -1,0 +1,14 @@
+[project]
+name = "skills-hub-mcp"
+version = "1.0.0"
+description = "Lightweight on-demand Agent Skills Hub MCP Server to prevent context window bloat."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=3.0.0",
+    "pyyaml>=6.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
