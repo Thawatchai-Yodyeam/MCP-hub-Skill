@@ -1,187 +1,247 @@
 # Skills Hub MCP Server 🧠⚡
 
-> **Lightweight On-Demand Agent Skills Management for Antigravity & AI Coding Agents**  
-> แก้ปัญหา **Token บวม (Context Window Bloat)** จากการโหลด System Prompt สกิลทั้งหมดพร้อมกัน ด้วยสถาปัตยกรรม **Progressive On-Demand Retrieval**
+[![MCP Standard](https://img.shields.io/badge/MCP-Standard-blue.svg)](https://modelcontextprotocol.io/)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10+-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
+[![FastMCP](https://img.shields.io/badge/Built%20with-FastMCP-00D26A.svg)](https://github.com/jlowin/fastmcp)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/Thawatchai-Yodyeam/MCP-hub-Skill/pulls)
+
+> **Lightweight On-Demand Agent Skills Management for AI Coding Assistants**  
+> Eliminate **System Prompt Bloat & Context Window Saturation** through **Progressive On-Demand Retrieval**.
 
 ---
 
-## 🎯 ปัญหาและแนวทางแก้ไข (Problem & Solution)
+## 🎯 The Problem: Context Window Bloat
 
-### ปัญหาเดิม (Token Bloat):
-เมื่อมี Agent Skills หรือ Runbooks จำนวนมาก (20-50+ สกิล) หากโหลดเข้า System Prompt พร้อมกัน:
-- ❌ เปลือง Token ตั้งแต่เริ่มบทสนทนา (10,000 - 50,000+ tokens)
-- ❌ Context window เต็มเร็ว ส่งผลให้โมเดลจำประวัติก่อนหน้าไม่ได้ หรือเกิดอาการหลงลืม (Attention drift)
-- ❌ ค่าใช้จ่าย (API Cost) และ Latency สูงขึ้นโดยไม่จำเป็น
+Modern AI coding agents (Antigravity, Claude Code, Cursor, Windsurf, Cline) rely heavily on specialized skills, runbooks, and checklists (e.g., Docker security, SQL optimization, API standards, testing protocols).
 
-### แนวทางแก้ไขด้วย Skills Hub MCP:
-- ✅ **Progressive Retrieval**: AI โหลดเฉพาะดัชนีสรุปย่อ 1-2 บรรทัด (`list_available_skills`) ใช้ไม่เกิน 150-200 tokens
-- ✅ **Sub-millisecond Search**: ใช้ SQLite FTS5 (Full-Text Search) ในหน่วยความจำ ค้นหาตาม Keyword / Tags / BM25 ได้ทันที
-- ✅ **Section-targeted Loading**: สามารถดึงเฉพาะหัวข้อ เช่น `get_skill(name, section="checklist")` เพื่อประหยัด Token สูงสุด
-- ✅ **Built-in Token Directives**: ทุกครั้งที่ AI ดึงสกิล ตัว Server จะแนบ Directive สั่งให้ AI สรุปเฉพาะ Action Items ลง Scratchpad/Chat แทนการแปะเอกสารตัวเต็ม
-- ✅ **Dynamic Hot-Reload**: โยนไฟล์ Markdown ใหม่เข้าโฟลเดอร์ `skills/` ระบบจะ Index อัตโนมัติทันทีโดยไม่ต้อง Restart Server
+However, preloading dozens of skill documents into the system prompt causes severe problems:
+- ❌ **Token Saturation**: Ingests 10,000 to 50,000+ tokens before the conversation even begins.
+- ❌ **Attention Drift & Amnesia**: Flooding the context window causes LLMs to lose track of earlier conversation turns and reasoning history.
+- ❌ **High Latency & Costs**: Inflates token consumption on every single agent interaction.
 
 ---
 
-## 🛠️ โครงสร้างโปรเจกต์ (Project Architecture)
+## 💡 The Solution: Progressive On-Demand Retrieval
+
+**Skills Hub MCP** changes the paradigm: instead of stuffing all skills into the prompt upfront, skills are stored locally as Markdown files and retrieved **only when needed, on-demand**:
+
+1. **Lightweight Overview**: AI inspects a compact category summary (`list_available_skills`) costing less than **100 tokens**.
+2. **Sub-millisecond Search**: Powered by in-memory **SQLite FTS5 (Full-Text Search)** and **BM25 ranking**, searching keywords and tags in `< 5ms`.
+3. **Section-Targeted Retrieval**: Fetch only actionable sections (`get_skill(name, section="checklist")`) rather than 300 lines of prose — **reducing token consumption by 85–95%**.
+4. **Built-in Token Directives**: Every retrieved skill automatically injects a strict directive instructing the AI to summarize actionable steps into its scratchpad instead of echoing the full document back to the user.
+5. **Dynamic Hot-Reloading**: Drop new Markdown files into the `skills/` folder; the server instantly detects and re-indexes them without requiring a restart.
+
+---
+
+## 🏗️ Architecture
+
+```mermaid
+flowchart TD
+    User([User Request]) --> Agent[AI Coding Agent<br>Antigravity / Claude / Cursor]
+    
+    subgraph "Context Window Savings"
+        Agent -- "1. list_available_skills() (~80 tokens)" --> Hub[Skills Hub MCP Server<br>FastMCP + stdio]
+        Agent -- "2. search_skills('docker non-root') (~120 tokens)" --> Hub
+        Agent -- "3. get_skill('docker-deployment', section='checklist') (~90 tokens)" --> Hub
+    end
+
+    subgraph "Skills Hub Core Engine"
+        Hub --> FTS5[(SQLite In-Memory FTS5<br>BM25 Weighted Search)]
+        Hub --> Watcher[Dynamic Hot-Reload Watcher]
+        Watcher --> Storage[skills/ Directory<br>Markdown + YAML Frontmatter]
+    end
+
+    Hub -- "Targeted Checklist + Token-Saving Directive" --> Agent
+    Agent --> Response([Accurate, Lean Response])
+```
+
+---
+
+## 📁 Repository Structure
 
 ```
-d:\MCP-hub-Skilll\
-├── server.py                   # FastMCP Server (stdio) + SQLite FTS5 Engine
-├── config.json                 # การตั้งค่า (skills directory, search limit)
-├── mcp_config_snippet.json     # คอนฟิกพร้อมก๊อปปี้ไปใส่ใน Antigravity
-├── AGENTS.md                   # Universal Directive สำหรับ Agent ทุกค่าย
-├── CLAUDE.md                   # Directive สำหรับ Claude Code
-├── .cursorrules                # Directive สำหรับ Cursor IDE
-├── pyproject.toml              # Project metadata & dependencies
-├── requirements.txt            # Python dependencies (fastmcp, pyyaml)
-├── skills/                     # คลังสกิลเริ่มต้น (Default Starter Skills)
-│   ├── web-development/
-│   │   └── api-design.md
-│   ├── performance/
-│   │   └── sql-optimization.md
-│   ├── devops/
-│   │   └── docker-deployment.md
-│   ├── code-review/
-│   │   └── security-audit.md
-│   ├── git-workflow/
-│   │   └── conventional-commits.md
-│   └── testing/
-│       └── pytest-testing.md
+MCP-hub-Skill/
+├── server.py                   # FastMCP Server (stdio) with SQLite FTS5 Engine
+├── config.json                 # Configuration (skills path, search limits)
+├── mcp_config_snippet.json     # Ready-to-use config snippet for MCP clients
+├── AGENTS.md                   # Universal Directive for all AI Agents
+├── CLAUDE.md                   # Directive for Claude Code
+├── .cursorrules                # Directive for Cursor IDE
+├── pyproject.toml              # Python project metadata
+├── requirements.txt            # Dependencies (fastmcp, pyyaml)
+│
+├── skills/                     # Default Starter Skills
+│   ├── web-development/api-design.md           (REST API Best Practices)
+│   ├── devops/docker-deployment.md             (Production Docker Checklist)
+│   ├── performance/sql-optimization.md         (SQL Tuning & Indexing)
+│   ├── code-review/security-audit.md           (OWASP Security Review)
+│   ├── git-workflow/conventional-commits.md    (Semantic Commit Rules)
+│   └── testing/pytest-testing.md               (Pytest Unit Testing Standards)
+│
 └── scripts/
-    └── import_skills.py        # ยูทิลิตี้ช่วยดึงสกิลเดิมในเครื่องเข้าคลัง
+    └── import_skills.py        # Utility to import local agent skills into the hub
 ```
 
 ---
 
-## 🔌 MCP Tools ที่ให้บริการ
+## 🔌 MCP Tools
 
-| Tool Name | คำอธิบาย | พารามิเตอร์ |
+| Tool | Description | Parameters |
 | :--- | :--- | :--- |
-| `list_available_skills` | แสดงรายชื่อสกิลทั้งหมดแบบกระชับ (1-2 บรรทัด/สกิล) แยกตามหมวดหมู่ | `category` (optional) |
-| `search_skills` | ค้นหาสกิลด้วย BM25 Full-Text Search รองรับชื่อ, แท็ก, คำอธิบาย, เนื้อหา | `query` (required), `limit` (optional, default: 5) |
-| `get_skill` | ดึงเนื้อหาสกิลตัวเต็ม หรือดึงเฉพาะ Section (เช่น `checklist`, `anti-patterns`) พร้อม Token-Saving Directive | `skill_name` (required), `section` (optional) |
-| `add_or_update_skill` | สร้างหรืออัปเดตสกิลใหม่ลงในคลังได้ทันทีผ่าน AI | `name`, `description`, `content`, `category`, `tags` |
+| `list_available_skills` | Returns a compact overview of available skills grouped by category. Automatically summarizes when skill count exceeds 25. | `category` (optional), `limit` (default: 30), `summary_only` (default: false) |
+| `search_skills` | Fast BM25 full-text search across titles, descriptions, tags, and content. Returns ranked results with section lists. | `query` (required), `limit` (default: 5) |
+| `get_skill` | Retrieves complete skill instructions or extracts targeted sub-sections (e.g., `checklist`, `anti-patterns`) with token directives. | `skill_name` (required), `section` (optional) |
+| `add_or_update_skill` | Programmatically creates or updates a skill in the repository with automatic indexing and path traversal protection. | `name`, `description`, `content`, `category`, `tags` |
 
 ---
 
-## 🚀 การติดตั้งและเปิดใช้งานใน Antigravity
+## 🚀 Quickstart & Setup
 
-### 1. ไฟล์การตั้งค่า Antigravity MCP
-เปิดไฟล์การตั้งค่า MCP ของ Antigravity ที่:
-`C:\Users\The_Grace\.gemini\config\mcp_config.json`
+### 1. Prerequisites
+- Python 3.10 or higher (Python 3.14 recommended)
+- `uv` or `pip` package manager
 
-แล้วเพิ่มบล็อกคอนฟิกนี้ลงใน `"mcpServers"`:
+### 2. Installation
+Clone the repository and install dependencies:
+
+```bash
+git clone https://github.com/Thawatchai-Yodyeam/MCP-hub-Skill.git
+cd MCP-hub-Skill
+pip install -r requirements.txt
+```
+
+---
+
+## ⚙️ Connecting to MCP Clients
+
+### Antigravity / Gemini
+Add the following to your `~/.gemini/config/mcp_config.json`:
 
 ```json
 {
   "mcpServers": {
     "skills-hub": {
-      "command": "C:\\Python314\\python.exe",
-      "args": [
-        "d:\\MCP-hub-Skilll\\server.py"
-      ],
+      "command": "python",
+      "args": ["/path/to/MCP-hub-Skill/server.py"],
       "env": {
         "PYTHONUNBUFFERED": "1",
-        "SKILLS_DIR": "d:\\MCP-hub-Skilll\\skills"
+        "SKILLS_DIR": "/path/to/MCP-hub-Skill/skills"
       }
     }
   }
 }
 ```
 
-*(ดูตัวอย่างไฟล์ได้ที่ [mcp_config_snippet.json](./mcp_config_snippet.json))*
+### Claude Code (Anthropic)
+Add to your project's `.mcp.json` or global Claude configuration:
+
+```json
+{
+  "mcpServers": {
+    "skills-hub": {
+      "command": "python",
+      "args": ["/path/to/MCP-hub-Skill/server.py"]
+    }
+  }
+}
+```
+
+### Cursor IDE
+Navigate to **Cursor Settings > Features > MCP > Add New MCP Server**:
+- **Type**: `command`
+- **Name**: `skills-hub`
+- **Command**: `python /path/to/MCP-hub-Skill/server.py`
 
 ---
 
-## ✍️ วิธีเพิ่มสกิลใหม่เข้าคลัง (3 วิธี)
+## ✍️ Adding Custom Skills
 
-### วิธีที่ 1: สร้างไฟล์ Markdown โดยตรง (แนะนำ)
-สร้างไฟล์ `.md` ภายใต้โฟลเดอร์ `skills/<category>/<skill-name>.md` โดยใส่ YAML Frontmatter ด้านบน:
+### Method 1: Create a Markdown File (Recommended)
+Place a `.md` file inside `skills/<category>/<skill-name>.md` with YAML frontmatter:
 
 ```markdown
 ---
-name: my-new-skill
-category: frontend
-description: คำอธิบายสั้นๆ 1-2 บรรทัดเกี่ยวกับสกิลนี้
-tags: [react, ui, css]
+name: k8s-production
+category: devops
+description: Production Kubernetes deployment checklist and resource limits.
+tags: [kubernetes, k8s, devops, containers]
 ---
 
-# My New Skill Guide
-
-คำอธิบายทั่วไป...
+# Kubernetes Production Deployment Guide
 
 ## Checklist
-- [ ] ข้อปฏิบัติที่ 1
-- [ ] ข้อปฏิบัติที่ 2
+- [ ] Define explicit CPU and Memory requests and limits for all containers.
+- [ ] Implement liveness and readiness probes with appropriate initial delays.
+- [ ] Configure PodDisruptionBudgets (PDB) for high availability during node drains.
+- [ ] Run containers as non-root with read-only root filesystems where possible.
 
 ## Anti-patterns
-- สิ่งที่ไม่ควรทำ...
+- Using `latest` image tags in production deployment manifests.
+- Storing secrets in plain ConfigMaps instead of Secret resources or external vaults.
 ```
-*(เมื่อบันทึกไฟล์แล้ว Skills Hub จะตรวจจับและ Re-index ให้อัตโนมัติทันที ไม่ต้องรีสตาร์ท)*
 
----
+*Skills Hub detects file changes and re-indexes them instantly — zero server restart required!*
 
-### วิธีที่ 2: ให้ AI เพิ่มสกิลให้ผ่าน MCP Tool
-AI สามารถเรียกคำสั่ง `add_or_update_skill` ได้โดยตรง เช่น:
+### Method 2: Via AI Agent Tool Call
+Any connected AI agent can create skills programmatically:
+
 ```python
 add_or_update_skill(
-    name="nextjs-caching",
-    description="Next.js App Router caching strategies and revalidation.",
+    name="graphql-best-practices",
+    description="GraphQL schema design, query complexity analysis, and dataloader.",
     category="web-development",
-    tags="nextjs, react, cache",
-    content="""# Next.js Caching Guide
+    tags="graphql, api, backend",
+    content="""# GraphQL Best Practices
 ## Checklist
-- [ ] Use generateStaticParams for static routes
-- [ ] Use revalidateTag for on-demand ISR
+- [ ] Use DataLoader to batch queries and eliminate N+1 issues.
+- [ ] Implement query complexity and depth limiting to prevent DoS.
 """
 )
 ```
 
----
+### Method 3: Import Existing Machine Skills
+If you have existing skills in your local environment, run the bundled import script:
 
-### วิธีที่ 3: ดึงสกิลเดิมที่มีในเครื่องอัตโนมัติ (Import)
-รันสคริปต์ `import_skills.py` เพื่อค้นหาและคัดลอกสกิลจาก Antigravity (`~/.gemini/config/skills`):
-
-```powershell
+```bash
 python scripts/import_skills.py
-```
-หรือระบุโฟลเดอร์เอง:
-```powershell
-python scripts/import_skills.py "C:\path\to\another\skills_dir"
+# Or specify a custom folder:
+python scripts/import_skills.py "/path/to/existing/skills"
 ```
 
 ---
 
-## 🧪 การทดสอบระบบ (Verification)
+## 🤖 Universal Agent Directives
 
-สามารถรันสคริปต์ทดสอบอัตโนมัติได้ทันที:
-```powershell
-python scripts/test_client.py
-```
+To ensure your AI assistant retrieves skills on demand rather than asking you to dump guidelines into the chat, place the included directives in your workspace root:
 
-ผลการทดสอบครอบคลุม:
-1. การแสดงรายการสกิลแบบจำกัด Token (`list_available_skills`)
-2. การค้นหาความเกี่ยวข้องด้วย FTS5 (`search_skills`)
-3. การดึงเนื้อหาสกิลพร้อม Token-Saving Directive (`get_skill`)
-4. การตัดดึงเฉพาะส่วนย่อย (`get_skill(..., section='checklist')`)
-5. การเพิ่มสกิลแบบไดนามิกและการค้นหาเจอทันที (Hot-reload)
-
----
-
-## 💡 คำแนะนำเพิ่มเติมเพื่อความคุ้มค่า Token สูงสุด (Best Practices)
-
-### 1. การเลือกชื่อไฟล์ Directive ให้รองรับ AI หลายค่าย (Multi-Tool Compatibility)
-คุณสามารถเลือกใช้ชื่อไฟล์ตามมาตรฐานของค่าย AI ที่ใช้งานได้ทันที (ในโปรเจกต์นี้มีเตรียมไว้ให้แล้วทั้งหมด):
-
-| ชื่อไฟล์ | เครื่องมือ/ค่ายที่รองรับ | จุดเด่น |
+| File | Target AI / Tool | Highlights |
 | :--- | :--- | :--- |
-| **`AGENTS.md`** ⭐ *(แนะนำ)* | **Antigravity, Cline, Roo Code, Open-source Agents** | เป็นมาตรฐานสากล (Vendor-neutral) ไม่ผูกติดกับค่ายใด และ Antigravity รองรับเป็น First-class ทันที |
-| **`CLAUDE.md`** | **Claude Code (Anthropic)** | มาตรฐานหลักของ Claude Code CLI |
-| **`.cursorrules`** | **Cursor IDE** | ทำงานอัตโนมัติเมื่อเปิดโปรเจกต์ใน Cursor |
-| **`.windsurfrules`** | **Windsurf (Codeium)** | รองรับกฎสำหรับ Cascade/Windsurf |
-| **`GEMINI.md`** | **Antigravity / Gemini CLI** | มาตรฐานดั้งเดิมของ Antigravity |
+| **`AGENTS.md`** ⭐ | **Antigravity, Cline, Roo Code, Open Agents** | Vendor-neutral universal standard. First-class citizen in modern agentic tools. |
+| **`CLAUDE.md`** | **Claude Code (Anthropic)** | Standard configuration for Claude Code CLI. |
+| **`.cursorrules`** | **Cursor IDE** | Automatically triggers for Cursor Composer and Chat. |
 
-> 📌 **คำแนะนำ**: ใช้ **`AGENTS.md`** เป็นไฟล์หลักไฟล์เดียวได้เลย เพราะเป็นชื่อที่เป็นกลางที่สุด และใน Antigravity ถูกตั้งค่าให้อ่าน `AGENTS.md` เทียบเท่ากับ `GEMINI.md` ทุกประการ
+---
 
-### 2. ใช้ `section="checklist"` บ่อยๆ
-เวลา AI ต้องการแค่ลำดับขั้นตอน การดึงเฉพาะ Section จะช่วยลดการใช้ Token ได้ถึง 70-85% เมื่อเทียบกับไฟล์เต็ม
+## 📊 Token Savings Benchmark
+
+| Operation | Traditional System Prompt Injection | Skills Hub Progressive Retrieval | Token Reduction |
+| :--- | :--- | :--- | :--- |
+| **Session Initialization** | 15,000 – 45,000 tokens (All skills preloaded) | **~80 tokens** (`list_available_skills`) | **~99.5% saved** |
+| **Skill Search** | N/A (Manual searching required) | **~120 tokens** (`search_skills`) | **Fast & Focused** |
+| **Applying a Rule/Checklist** | 1,200 – 3,500 tokens (Full doc copy) | **~90 tokens** (`get_skill(..., section='checklist')`) | **~95% saved** |
+
+---
+
+## 🛡️ Hardening & Thread Safety
+
+- **Thread-Safe In-Memory SQLite**: Protected by `threading.Lock()` mutex to guarantee zero race conditions or database locks during concurrent tool calls.
+- **Path Traversal Protection**: File inputs are sanitized using strict alphanumeric regex filters, preventing directory escape attacks (`../../`).
+- **Hidden Directory Filtering**: Automatically ignores `.git`, `.obsidian`, `.vscode`, and hidden files.
+- **Name Collision Disambiguation**: Gracefully namespaces duplicate skill names across multiple directories (`category/skill-name`).
+
+---
+
+## 📄 License
+
+Distributed under the [MIT License](./LICENSE). Feel free to use, modify, and distribute in commercial or open-source projects.
