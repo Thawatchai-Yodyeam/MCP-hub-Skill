@@ -27,9 +27,9 @@ However, preloading dozens of skill documents into the system prompt causes seve
 **Skills Hub MCP** changes the paradigm: instead of stuffing all skills into the prompt upfront, skills are stored locally as Markdown files and retrieved **only when needed, on-demand**:
 
 1. **Lightweight Overview**: `list_available_skills` returns a compact index (about 300 tokens for the 6 starter skills, about 150 with `summary_only=True`). Above 25 skills it automatically collapses to one line per category.
-2. **Fast Search**: In-memory **SQLite FTS5 (Full-Text Search)** with **BM25 ranking** — about 0.5 ms per query on the starter skills, including the change scan. Skills matching every keyword are listed first, followed by partial matches. A substring fallback covers languages written without spaces between words, such as Thai.
+2. **Fast Search**: In-memory **SQLite FTS5 (Full-Text Search)** with **BM25 ranking** — under 1 ms per query on the starter skills, including the change scan. Skills matching every keyword are listed first, followed by partial matches. A substring fallback covers languages written without spaces between words, such as Thai.
 3. **Section-Targeted Retrieval**: Fetch only the section you need (`get_skill(name, section="checklist")`) instead of the whole document. Savings grow with skill length: the starter skills are short, so a checklist response is only about 20% smaller than the full skill, while long runbooks save far more.
-4. **Token-Saving Directive**: Every `get_skill` response starts with a short directive (about 110 tokens) asking the agent not to echo the document back. This only saves output tokens — the retrieved text still enters the context, which is why section-targeted retrieval matters most.
+4. **Token-Saving Directive**: Every `get_skill` response starts with a short directive (about 110 tokens) asking the agent not to echo the document back. This only saves output tokens — the retrieved text still enters the context, which is why section-targeted retrieval matters most. Turn it off with `"token_saver_directive": false` in `config.json`.
 5. **Hot-Reloading**: Every tool call re-scans the `skills/` folder and re-indexes only files that were added, changed, or deleted. No restart and no background watcher needed.
 
 ### Where Skills Hub Fits
@@ -69,7 +69,7 @@ flowchart TD
 ```
 MCP-hub-Skill/
 ├── server.py                   # FastMCP Server (stdio) with SQLite FTS5 Engine
-├── config.json                 # Configuration (skills directory)
+├── config.json                 # Configuration (see below)
 ├── mcp_config_snippet.json     # Example MCP client config (edit the paths for your machine)
 ├── AGENTS.md                   # Universal Directive for all AI Agents
 ├── CLAUDE.md                   # Directive for Claude Code
@@ -99,7 +99,7 @@ MCP-hub-Skill/
 | :--- | :--- | :--- |
 | `list_available_skills` | Returns a compact overview of available skills grouped by category. Automatically summarizes when skill count exceeds 25. | `category` (optional), `limit` (default: 30), `summary_only` (default: false) |
 | `search_skills` | Fast BM25 full-text search across titles, descriptions, tags, and content. Returns ranked results with section lists. | `query` (required), `limit` (default: 5) |
-| `get_skill` | Retrieves complete skill instructions or extracts targeted sub-sections (e.g., `checklist`, `anti-patterns`) with token directives. | `skill_name` (required), `section` (optional) |
+| `get_skill` | Retrieves complete skill instructions or extracts one H2/H3 section by heading (e.g., `checklist`, `anti-patterns`). An H2 section includes its H3 subsections; `"frontend checklist"` picks `### Checklist` under `## Frontend`. Folder skills also list their bundled files. | `skill_name` (required), `section` (optional) |
 | `add_or_update_skill` | Creates a skill, or overwrites the existing one with the same name and category, then re-indexes it. Names and categories are limited to letters, digits, `_` and `-`, which blocks path traversal. | `name`, `description`, `content`, `category`, `tags` |
 
 ---
@@ -191,6 +191,22 @@ tags: [kubernetes, k8s, devops, containers]
 
 *Skills Hub detects file changes and re-indexes them instantly — zero server restart required!*
 
+`get_skill(section=...)` splits skills on `##` and `###` headings, so give each part you want to fetch on its own (checklist, anti-patterns, examples) its own heading.
+
+### Method 1b: Folder Skills (`SKILL.md`)
+Skills in the Agent Skills folder format work too. Put the folder at `skills/<category>/<skill-name>/`:
+
+```
+skills/devops/k8s-production/
+├── SKILL.md          # indexed as skill 'k8s-production' (frontmatter as above)
+├── references/       # bundled files: not indexed as separate skills
+│   └── probes.md
+└── scripts/
+    └── check.sh
+```
+
+Without a `name` or `category` in the frontmatter, the skill is named after its folder and categorized by the folder above it. `get_skill` lists the bundled files and their location, so an agent with file access can open them.
+
 ### Method 2: Via AI Agent Tool Call
 Any connected AI agent can create skills programmatically:
 
@@ -216,6 +232,23 @@ python scripts/import_skills.py
 # Or specify a custom folder:
 python scripts/import_skills.py "/path/to/existing/skills"
 ```
+
+- A folder with a `SKILL.md` is copied whole (including `references/`, `scripts/`, ...) to `skills/<category>/<skill-name>/`. Other `.md` files become single-file skills at `skills/<category>/<skill-name>.md`.
+- The category comes from the frontmatter, then from the folder holding the skill, otherwise `imported`.
+- Frontmatter keys other than name, category, description and tags (e.g. `license`, `allowed-tools`) are kept.
+
+---
+
+## 🔧 Configuration
+
+`config.json` in the repository root (all keys optional):
+
+| Key | Default | Description |
+| :--- | :--- | :--- |
+| `skills_directory` | `"skills"` | Skills folder, relative to the repository root. The `SKILLS_DIR` environment variable overrides it. |
+| `search_limit` | `5` | Default number of `search_skills` results. |
+| `max_description_length` | `150` | Descriptions longer than this are trimmed in `list_available_skills` and `search_skills` results. |
+| `token_saver_directive` | `true` | Start every `get_skill` response with the token-saving directive (~110 tokens). |
 
 ---
 
@@ -244,7 +277,7 @@ Measured on the 6 bundled starter skills. Tokens are estimated at ~4 characters 
 | `search_skills('docker non-root')` | ~90 |
 | `get_skill('docker-deployment')` (full skill) | ~355 |
 | `get_skill('docker-deployment', section='checklist')` | ~280 |
-| MCP tool definitions (loaded once per session) | ~650 |
+| MCP tool definitions (loaded once per session) | ~670 |
 
 Preloading costs grow with every skill you add. The hub's overview stays small (one line per category above 25 skills), and search and retrieval only cost tokens for the skills you actually use. With just a few short skills, preloading can be cheaper than the hub's tool definitions; the hub pays off as the library grows.
 

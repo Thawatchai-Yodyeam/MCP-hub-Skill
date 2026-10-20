@@ -3,12 +3,15 @@
 Scan existing Antigravity or local skills folders (containing SKILL.md or *.md)
 and import them into the Skills Hub repository.
 
+A folder with a SKILL.md is imported whole (references/, scripts/, assets/ ...)
+into skills/<category>/<skill-name>/. Any other .md file becomes a single-file
+skill at skills/<category>/<skill-name>.md.
+
 Usage:
     python scripts/import_skills.py
     python scripts/import_skills.py "C:\\path\\to\\custom\\skills"
 """
 
-import os
 import re
 import shutil
 import sys
@@ -30,6 +33,8 @@ DEFAULT_SEARCH_PATHS = [
     Path.home() / ".gemini" / "antigravity" / "builtin" / "skills",
 ]
 
+IGNORED_FILES = ["readme.md", "license.md", "changelog.md"]
+
 
 def parse_frontmatter(content: str):
     fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)$", content, re.DOTALL)
@@ -42,7 +47,16 @@ def parse_frontmatter(content: str):
     return {}, content.strip()
 
 
-def import_skill_file(source_file: Path, category_override: str = None):
+def clean_slug(value) -> str:
+    """Lowercase and keep only letters, digits, '_' and '-', so values can't escape the skills folder."""
+    return re.sub(r"[^\w\-]", "", str(value).lower().strip())
+
+
+def is_hidden(path: Path, root: Path) -> bool:
+    return any(part.startswith(".") for part in path.relative_to(root).parts)
+
+
+def import_skill_file(source_file: Path, source_root: Path):
     try:
         with open(source_file, "r", encoding="utf-8") as f:
             content = f.read()
@@ -52,12 +66,18 @@ def import_skill_file(source_file: Path, category_override: str = None):
 
     fm, body = parse_frontmatter(content)
 
-    skill_name = fm.get("name") or (source_file.parent.name if source_file.name.lower() == "skill.md" else source_file.stem)
-    skill_name = re.sub(r"[^\w\-]", "", str(skill_name).lower().strip())
+    # A folder skill (<category>/<skill>/SKILL.md) is named after its folder; a plain file after the file
+    is_folder_skill = source_file.name.lower() == "skill.md" and source_file.parent != source_root
+    skill_path = source_file.parent if is_folder_skill else source_file.with_suffix("")
+
+    skill_name = clean_slug(fm.get("name") or skill_path.name)
     if not skill_name:
         return False
 
-    category = category_override or fm.get("category") or "imported"
+    # Category: frontmatter first, then the folder holding the skill (unless that's the scanned root)
+    folder_category = skill_path.parent.name if skill_path.parent != source_root else ""
+    category = clean_slug(fm.get("category") or folder_category) or "imported"
+
     description = fm.get("description", "")
     if not description or str(description).strip() in ["---", ""]:
         for line in body.splitlines():
@@ -66,17 +86,29 @@ def import_skill_file(source_file: Path, category_override: str = None):
                 description = line_str[:120]
                 break
 
-    tags = fm.get("tags", [category, "imported"])
+    tags = fm.get("tags") or [category, "imported"]
     if isinstance(tags, str):
         tags = [t.strip() for t in tags.split(",") if t.strip()]
+    tags = list(dict.fromkeys(tags)) if isinstance(tags, list) else []
 
-    target_dir = TARGET_SKILLS_DIR / category
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target_file = target_dir / f"{skill_name}.md"
+    if is_folder_skill:
+        # Copy the whole folder so bundled references/scripts keep working
+        target_dir = TARGET_SKILLS_DIR / category / skill_name
+        shutil.copytree(source_file.parent, target_dir, dirs_exist_ok=True, ignore=shutil.ignore_patterns(".*"))
+        # Replace the copied original (e.g. 'skill.md') with the normalized SKILL.md written below
+        (target_dir / source_file.name).unlink(missing_ok=True)
+        target_file = target_dir / "SKILL.md"
+    else:
+        target_dir = TARGET_SKILLS_DIR / category
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_file = target_dir / f"{skill_name}.md"
 
+    # Normalized keys first; other frontmatter keys (license, allowed-tools, ...) are kept after them.
     # safe_dump quotes values containing ':', '#', newlines, etc.
+    metadata = {"name": skill_name, "category": category, "description": str(description).strip(), "tags": tags}
+    metadata.update({k: v for k, v in fm.items() if k not in metadata})
     frontmatter = yaml.safe_dump(
-        {"name": skill_name, "category": category, "description": str(description).strip(), "tags": tags if isinstance(tags, list) else []},
+        metadata,
         allow_unicode=True,
         sort_keys=False,
         default_flow_style=None,
@@ -98,13 +130,17 @@ def scan_and_import(source_dir: Path):
     print(f"\n[*] Scanning: {source_dir}")
     imported_count = 0
 
-    # Look for SKILL.md or *.md
-    for skill_file in source_dir.rglob("*.md"):
+    md_files = sorted(p for p in source_dir.rglob("*.md") if not is_hidden(p, source_dir))
+    skill_dirs = {p.parent for p in md_files if p.name.lower() == "skill.md" and p.parent != source_dir}
+
+    for skill_file in md_files:
         # Ignore readme / license
-        if skill_file.name.lower() in ["readme.md", "license.md", "changelog.md"]:
+        if skill_file.name.lower() in IGNORED_FILES:
             continue
-        category = skill_file.parent.name if skill_file.name.lower() == "skill.md" else "imported"
-        if import_skill_file(skill_file, category_override=category):
+        # Other .md files inside a skill folder are bundled resources, copied along with its SKILL.md
+        if skill_file.name.lower() != "skill.md" and any(parent in skill_dirs for parent in skill_file.parents):
+            continue
+        if import_skill_file(skill_file, source_dir):
             imported_count += 1
 
     print(f"[✓] Finished importing {imported_count} skills from {source_dir.name}")
@@ -112,7 +148,7 @@ def scan_and_import(source_dir: Path):
 
 def main():
     if len(sys.argv) > 1:
-        custom_path = Path(sys.argv[1])
+        custom_path = Path(sys.argv[1]).resolve()
         scan_and_import(custom_path)
     else:
         print("Starting Skills Importer...")

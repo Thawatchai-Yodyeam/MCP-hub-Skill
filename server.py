@@ -35,13 +35,16 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 
 
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "skills_directory": str(BASE_DIR / "skills"),
+    "search_limit": 5,
+    "max_description_length": 150,
+    "token_saver_directive": True,
+}
+
+
 def load_config() -> Dict[str, Any]:
-    default_config = {
-        "skills_directory": str(BASE_DIR / "skills"),
-        "search_limit": 5,
-        "max_description_length": 150,
-        "token_saver_directive": True,
-    }
+    default_config = dict(DEFAULT_CONFIG)
     if CONFIG_PATH.exists():
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -49,6 +52,14 @@ def load_config() -> Dict[str, Any]:
                 default_config.update(user_config)
         except Exception:
             pass
+
+    # Fall back to defaults for numbers that are missing or invalid
+    for key in ("search_limit", "max_description_length"):
+        try:
+            default_config[key] = max(1, int(default_config[key]))
+        except (TypeError, ValueError):
+            default_config[key] = DEFAULT_CONFIG[key]
+    default_config["token_saver_directive"] = bool(default_config["token_saver_directive"])
 
     # Support environment variable override
     env_dir = os.environ.get("SKILLS_DIR")
@@ -65,6 +76,19 @@ def load_config() -> Dict[str, Any]:
 
 CONFIG = load_config()
 SKILLS_DIR = Path(CONFIG["skills_directory"])
+SEARCH_LIMIT: int = CONFIG["search_limit"]
+MAX_DESCRIPTION_LENGTH: int = CONFIG["max_description_length"]
+TOKEN_SAVER_DIRECTIVE: bool = CONFIG["token_saver_directive"]
+
+
+def shorten(text: str, max_length: int = MAX_DESCRIPTION_LENGTH) -> str:
+    """Trim text to max_length characters, marking the cut with '...'."""
+    return text if len(text) <= max_length else text[: max(max_length - 3, 0)].rstrip() + "..."
+
+
+def is_hidden(path: Path, root: Path) -> bool:
+    """True if any part of path below root starts with '.' (.git, .obsidian, ...)."""
+    return any(part.startswith(".") for part in path.relative_to(root).parts)
 
 
 class SkillIndexer:
@@ -110,29 +134,82 @@ class SkillIndexer:
         self.conn.commit()
 
     @staticmethod
-    def _parse_sections(markdown_text: str) -> Dict[str, str]:
-        """Extract H2/H3 sections from markdown text."""
-        sections: Dict[str, str] = {}
-        current_section = "overview"
-        lines: List[str] = []
+    def _parse_sections(markdown_text: str) -> List[Dict[str, Any]]:
+        """Split markdown into H2/H3 sections, in document order.
 
-        for line in markdown_text.splitlines():
-            header_match = re.match(r"^(#{2,3})\s+(.*)$", line.strip())
-            if header_match:
-                if lines:
-                    sections[current_section.lower()] = "\n".join(lines).strip()
-                    lines = []
-                current_section = header_match.group(2).strip()
-            else:
-                lines.append(line)
+        An H2 section includes its H3 subsections. An H3 section's 'path' names its
+        parent H2 (e.g. 'Frontend > Checklist'). Headings inside code fences are
+        ignored. Text before the first H2/H3, minus H1 titles, becomes 'Overview'.
+        """
+        lines = markdown_text.splitlines()
+        headings: List[tuple] = []  # (line index, level, title)
+        h1_lines = set()
+        fence = None
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if fence:
+                if stripped.startswith(fence):
+                    fence = None
+                continue
+            if stripped.startswith(("```", "~~~")):
+                fence = stripped[:3]
+                continue
+            heading = re.match(r"^ {0,3}(#{1,3})\s+(.+?)(?:\s+#+)?\s*$", line)
+            if heading and len(heading.group(1)) == 1:
+                h1_lines.add(i)
+            elif heading:
+                headings.append((i, len(heading.group(1)), heading.group(2).strip()))
 
-        if lines:
-            sections[current_section.lower()] = "\n".join(lines).strip()
+        sections: List[Dict[str, Any]] = []
+        intro_end = headings[0][0] if headings else len(lines)
+        intro = "\n".join(line for i, line in enumerate(lines[:intro_end]) if i not in h1_lines).strip()
+        if intro and not any(title.lower() == "overview" for _, _, title in headings):
+            sections.append({"title": "Overview", "level": 1, "path": "Overview", "body": intro})
+
+        parent = None
+        for n, (start, level, title) in enumerate(headings):
+            # A section runs until the next heading of the same or a higher level
+            end = next((i for i, lvl, _ in headings[n + 1:] if lvl <= level), len(lines))
+            if level == 2:
+                parent = title
+            sections.append({
+                "title": title,
+                "level": level,
+                "path": f"{parent} > {title}" if level == 3 and parent else title,
+                "body": "\n".join(lines[start + 1:end]).strip(),
+            })
 
         return sections
 
     @staticmethod
-    def _parse_markdown_file(file_path: Path) -> Optional[Dict[str, Any]]:
+    def find_sections(sections: List[Dict[str, Any]], query: str) -> List[Dict[str, Any]]:
+        """Return the sections matching query, using the strictest rule that finds any."""
+        def words(text: str) -> List[str]:
+            return [w.casefold() for w in SkillIndexer._query_terms(text)]
+
+        query_words = words(query)
+        if not query_words:
+            return []
+        squashed_query = "".join(query_words)
+
+        rules = (
+            # Same title, ignoring case and punctuation ('anti patterns' == 'Anti-Patterns')
+            lambda s: words(s["title"]) == query_words,
+            # Every query word starts a heading word ('anti-pattern' -> 'Anti-Patterns', 'frontend check' -> 'Frontend > Checklist')
+            lambda s: all(any(w.startswith(q) for w in words(s["path"])) for q in query_words),
+            # Every heading word appears in the query ('checklist items' -> 'Checklist')
+            lambda s: all(any(q.startswith(w) for q in query_words) for w in words(s["path"])),
+            # Substring, for scripts written without spaces between words (Thai, CJK)
+            lambda s: squashed_query in "".join(words(s["path"])),
+        )
+        for rule in rules:
+            matches = [s for s in sections if rule(s)]
+            if matches:
+                return matches
+        return []
+
+    @staticmethod
+    def _parse_markdown_file(file_path: Path, skills_dir: Path) -> Optional[Dict[str, Any]]:
         """Parse YAML frontmatter and markdown body from file."""
         try:
             with open(file_path, "r", encoding="utf-8") as f:
@@ -158,15 +235,12 @@ class SkillIndexer:
         if file_path.name.lower() in ["readme.md", "license.md", "changelog.md"]:
             return None
 
-        # Extract or fallback fields
-        if file_path.stem.lower() == "skill":
-            name = frontmatter.get("name") or file_path.parent.name
-            parent_cat = file_path.parent.parent.name
-            category = frontmatter.get("category") or (parent_cat if parent_cat and parent_cat != "skills" else file_path.parent.name)
-        else:
-            name = frontmatter.get("name") or file_path.stem
-            parent_cat = file_path.parent.name
-            category = frontmatter.get("category") or (parent_cat if parent_cat and parent_cat != "skills" else "general")
+        # Extract or fallback fields. A folder skill (<category>/<skill>/SKILL.md) is named
+        # after its folder; a plain file (<category>/<skill>.md) after the file.
+        is_folder_skill = file_path.name.lower() == "skill.md" and file_path.parent != skills_dir
+        skill_path = file_path.parent if is_folder_skill else file_path.with_suffix("")
+        name = frontmatter.get("name") or skill_path.name
+        category = frontmatter.get("category") or (skill_path.parent.name if skill_path.parent != skills_dir else "general")
 
         description = frontmatter.get("description", "")
         if not description or str(description).strip() in ["---", ""]:
@@ -174,7 +248,7 @@ class SkillIndexer:
             for line in body.splitlines():
                 clean_line = line.strip()
                 if clean_line and not clean_line.startswith(("#", "---", "```", ">", "-")):
-                    description = clean_line[:150]
+                    description = shorten(clean_line)
                     break
 
         raw_tags = frontmatter.get("tags", [])
@@ -210,9 +284,13 @@ class SkillIndexer:
 
         with self._lock:
             # Filter out hidden folders (.git, .obsidian, etc.)
+            md_files = [p for p in self.skills_dir.rglob("*.md") if not is_hidden(p, self.skills_dir)]
+
+            # A folder containing SKILL.md is one skill; other .md files inside it are bundled resources
+            skill_dirs = {p.parent for p in md_files if p.name.lower() == "skill.md" and p.parent != self.skills_dir}
             current_files = {}
-            for p in self.skills_dir.rglob("*.md"):
-                if any(part.startswith(".") for part in p.parts):
+            for p in md_files:
+                if p.name.lower() != "skill.md" and any(parent in skill_dirs for parent in p.parents):
                     continue
                 current_files[str(p.resolve())] = p
 
@@ -239,7 +317,7 @@ class SkillIndexer:
                 self._remove_file(cursor, fpath_str)
                 self._file_mtimes[fpath_str] = mtime
 
-                parsed = self._parse_markdown_file(path_obj)
+                parsed = self._parse_markdown_file(path_obj, self.skills_dir)
                 if not parsed:
                     continue
 
@@ -421,6 +499,30 @@ TOKEN_DIRECTIVE = """
 """.strip()
 
 
+def load_sections(sections_json: Optional[str]) -> List[Dict[str, Any]]:
+    try:
+        return json.loads(sections_json) if sections_json else []
+    except Exception:
+        return []
+
+
+def bundled_files(skill_file: Path, max_files: int = 20) -> str:
+    """Describe the files shipped next to a folder skill's SKILL.md ('' for single-file skills)."""
+    folder = skill_file.parent
+    if skill_file.name.lower() != "skill.md" or folder == SKILLS_DIR.resolve() or not folder.is_dir():
+        return ""
+    files = sorted(
+        p.relative_to(folder).as_posix()
+        for p in folder.rglob("*")
+        if p.is_file() and p != skill_file and not is_hidden(p, folder)
+    )
+    if not files:
+        return ""
+    listed = ", ".join(f"`{f}`" for f in files[:max_files])
+    more = f" and {len(files) - max_files} more" if len(files) > max_files else ""
+    return f"\n\n---\nBundled files in `{folder}`: {listed}{more}"
+
+
 @mcp.tool()
 def list_available_skills(
     category: Optional[str] = None,
@@ -470,10 +572,7 @@ def list_available_skills(
             lines.append(f"**[{current_cat}]**")
 
         tags_info = f" `[{s['tags']}]`" if s.get("tags") else ""
-        desc = s["description"]
-        if len(desc) > 120:
-            desc = desc[:117] + "..."
-        lines.append(f"- **`{s['name']}`**:{tags_info} {desc}")
+        lines.append(f"- **`{s['name']}`**:{tags_info} {shorten(s['description'])}")
 
     if total > limit:
         lines.append(f"\n*...and {total - limit} more skills. Call with limit={total} or filter by category.*")
@@ -484,13 +583,13 @@ def list_available_skills(
 
 
 @mcp.tool()
-def search_skills(query: str, limit: int = 5) -> str:
+def search_skills(query: str, limit: int = SEARCH_LIMIT) -> str:
     """Search skills by keyword, tag, or topic using fast Full-Text Search (FTS5).
     Skills matching all keywords are listed first, followed by skills matching only some of them.
 
     Args:
         query: Keywords to search (e.g., 'docker security', 'sql index', 'api rest')
-        limit: Maximum number of results to return (default: 5)
+        limit: Maximum number of results to return (default: `search_limit` in config.json)
     """
     results = indexer.search(query=query, limit=limit)
     if not results:
@@ -499,18 +598,12 @@ def search_skills(query: str, limit: int = 5) -> str:
     output = [f"### Search Results for '{query}' (Found: {len(results)})", ""]
 
     for i, r in enumerate(results, 1):
-        sections: Dict[str, str] = {}
-        if r.get("sections_json"):
-            try:
-                sections = json.loads(r["sections_json"])
-            except Exception:
-                pass
-
-        sec_names = [k.title() for k in sections.keys() if k != "overview"]
+        # Only top-level (H2) sections, to keep results short
+        sec_names = [s["title"] for s in load_sections(r.get("sections_json")) if s["level"] == 2]
         sec_hint = f" (Sections: {', '.join(sec_names)})" if sec_names else ""
 
         output.append(f"{i}. **`{r['name']}`** [{r['category']}]{sec_hint}")
-        output.append(f"   Summary: {r['description']}")
+        output.append(f"   Summary: {shorten(r['description'])}")
         if r.get("tags"):
             output.append(f"   Tags: {r['tags']}")
         output.append("")
@@ -525,41 +618,37 @@ def get_skill(skill_name: str, section: Optional[str] = None) -> str:
 
     Args:
         skill_name: The name identifier of the skill (e.g., 'sql-optimization', 'api-design')
-        section: Optional specific section to extract (e.g., 'checklist', 'anti-patterns') to save maximum tokens.
+        section: Optional H2/H3 heading to extract (e.g., 'checklist', 'anti-patterns') to save maximum tokens.
+            An H2 section includes its H3 subsections; use 'Parent Child' words to pick a specific H3.
     """
     skill = indexer.get_skill(skill_name)
     if not skill:
         return f"Skill '{skill_name}' not found. Use `list_available_skills()` or `search_skills()` to find valid skill names."
 
-    sections: Dict[str, str] = {}
-    if skill.get("sections_json"):
-        try:
-            sections = json.loads(skill["sections_json"])
-        except Exception:
-            pass
-
-    content_to_return = ""
+    sections = load_sections(skill.get("sections_json"))
     header_info = f"# Skill: `{skill['name']}` [{skill['category']}]"
 
     if section and section.strip():
-        target_sec = section.strip().lower()
-        # Find closest matching section key
-        matched_content = None
-        for k, v in sections.items():
-            if target_sec in k or k in target_sec:
-                matched_content = (k, v)
-                break
-
-        if matched_content:
-            sec_title, sec_body = matched_content
-            content_to_return = f"{header_info} > Section: `{sec_title.title()}`\n\n{sec_body}"
-        else:
-            available_secs = ", ".join([f"`{k}`" for k in sections.keys() if k != "overview"])
+        matches = indexer.find_sections(sections, section)
+        if not matches:
+            available_secs = ", ".join(f"`{s['path']}`" for s in sections)
             return f"Section '{section}' not found in skill '{skill_name}'.\nAvailable sections: {available_secs or 'None'}\n\nCall `get_skill('{skill_name}')` without a section to read the full skill."
-    else:
-        content_to_return = f"{header_info}\n\n{skill['content']}"
 
-    # Prepend Token Saver Directive
+        best = matches[0]
+        content_to_return = f"{header_info} > Section: `{best['path']}`\n\n{best['body']}"
+
+        # Mention other matches, except subsections already included in an H2 match
+        others = [
+            s["path"] for s in matches[1:]
+            if not (best["level"] == 2 and s["path"].startswith(f"{best['title']} > "))
+        ]
+        if others:
+            content_to_return += "\n\n*Other matching sections: " + ", ".join(f"`{p}`" for p in others) + "*"
+    else:
+        content_to_return = f"{header_info}\n\n{skill['content']}{bundled_files(Path(skill['filepath']))}"
+
+    if not TOKEN_SAVER_DIRECTIVE:
+        return content_to_return
     return f"{TOKEN_DIRECTIVE}\n\n{content_to_return}"
 
 
