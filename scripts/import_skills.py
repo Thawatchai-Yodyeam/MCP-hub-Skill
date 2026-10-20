@@ -74,15 +74,15 @@ def import_skill_file(source_file: Path, category_override: str = None):
     target_dir.mkdir(parents=True, exist_ok=True)
     target_file = target_dir / f"{skill_name}.md"
 
-    new_file_content = f"""---
-name: {skill_name}
-category: {category}
-description: {str(description).strip()}
-tags: {tags}
----
-
-{body}
-"""
+    # safe_dump quotes values containing ':', '#', newlines, etc.
+    frontmatter = yaml.safe_dump(
+        {"name": skill_name, "category": category, "description": str(description).strip(), "tags": tags if isinstance(tags, list) else []},
+        allow_unicode=True,
+        sort_keys=False,
+        default_flow_style=None,
+        width=float("inf"),
+    )
+    new_file_content = f"---\n{frontmatter}---\n\n{body}\n"
     with open(target_file, "w", encoding="utf-8") as f:
         f.write(new_file_content)
 

@@ -11,6 +11,7 @@ import re
 import sqlite3
 import sys
 import threading
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import yaml
@@ -68,6 +69,9 @@ SKILLS_DIR = Path(CONFIG["skills_directory"])
 
 class SkillIndexer:
     """Manages skill indexing with SQLite FTS5 in-memory database."""
+
+    # Field weights for ranking: name, category, description, tags, content (same order as skills_fts)
+    FIELD_WEIGHTS = (("name", 10.0), ("category", 5.0), ("description", 5.0), ("tags", 8.0), ("content", 1.0))
 
     def __init__(self, skills_dir: Path):
         self.skills_dir = skills_dir
@@ -192,8 +196,14 @@ class SkillIndexer:
             "mtime": file_path.stat().st_mtime,
         }
 
+    @staticmethod
+    def _remove_file(cursor: sqlite3.Cursor, fpath: str):
+        """Remove the indexed entry of a file, whatever skill name it was stored under."""
+        cursor.execute("DELETE FROM skills_fts WHERE rowid IN (SELECT rowid FROM skills WHERE filepath = ?)", (fpath,))
+        cursor.execute("DELETE FROM skills WHERE filepath = ?", (fpath,))
+
     def sync_index(self):
-        """Re-index files if modified or added, remove deleted files. Sub-millisecond if unchanged."""
+        """Re-index files if modified or added, remove deleted files. Cheap if nothing changed."""
         if not self.skills_dir.exists():
             self.skills_dir.mkdir(parents=True, exist_ok=True)
             return
@@ -209,67 +219,70 @@ class SkillIndexer:
             cursor = self.conn.cursor()
 
             # Check for deleted files
-            known_files = list(self._file_mtimes.keys())
-            for fpath in known_files:
+            for fpath in list(self._file_mtimes.keys()):
                 if fpath not in current_files:
-                    cursor.execute("SELECT name FROM skills WHERE filepath = ?", (fpath,))
-                    row = cursor.fetchone()
-                    if row:
-                        skill_name = row["name"]
-                        cursor.execute("DELETE FROM skills WHERE name = ?", (skill_name,))
-                        cursor.execute("DELETE FROM skills_fts WHERE name = ?", (skill_name,))
+                    self._remove_file(cursor, fpath)
                     del self._file_mtimes[fpath]
 
-            # Check for new or updated files
+            # Check for new or updated files. Any mtime change counts, since a checkout
+            # or copy can replace a file with one that has an older timestamp.
             for fpath_str, path_obj in current_files.items():
                 try:
                     mtime = path_obj.stat().st_mtime
                 except OSError:
                     continue
 
-                last_mtime = self._file_mtimes.get(fpath_str)
-                if last_mtime is None or mtime > last_mtime:
-                    parsed = self._parse_markdown_file(path_obj)
-                    if not parsed:
-                        continue
+                if self._file_mtimes.get(fpath_str) == mtime:
+                    continue
 
-                    # Check for name collisions across different files
-                    cursor.execute("SELECT filepath FROM skills WHERE name = ? AND filepath != ?", (parsed["name"], parsed["filepath"]))
-                    if cursor.fetchone():
-                        parsed["name"] = f"{parsed['category']}/{parsed['name']}"
+                # Drop the old entry by path first, so renaming a skill doesn't leave a stale row behind
+                self._remove_file(cursor, fpath_str)
+                self._file_mtimes[fpath_str] = mtime
 
-                    # Delete existing record if any
-                    cursor.execute("DELETE FROM skills WHERE name = ?", (parsed["name"],))
-                    cursor.execute("DELETE FROM skills_fts WHERE name = ?", (parsed["name"],))
+                parsed = self._parse_markdown_file(path_obj)
+                if not parsed:
+                    continue
 
-                    # Insert into storage
-                    cursor.execute("""
-                        INSERT INTO skills (name, category, description, tags, filepath, content, sections_json, mtime)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        parsed["name"],
-                        parsed["category"],
-                        parsed["description"],
-                        parsed["tags"],
-                        parsed["filepath"],
-                        parsed["content"],
-                        parsed["sections_json"],
-                        parsed["mtime"],
-                    ))
+                # Check for name collisions with other files
+                for candidate in (
+                    parsed["name"],
+                    f"{parsed['category']}/{parsed['name']}",
+                    path_obj.relative_to(self.skills_dir).with_suffix("").as_posix(),
+                ):
+                    cursor.execute("SELECT 1 FROM skills WHERE name = ?", (candidate,))
+                    if not cursor.fetchone():
+                        parsed["name"] = candidate
+                        break
+                else:
+                    continue
 
-                    # Insert into FTS5
-                    cursor.execute("""
-                        INSERT INTO skills_fts (name, category, description, tags, content)
-                        VALUES (?, ?, ?, ?, ?)
-                    """, (
-                        parsed["name"],
-                        parsed["category"],
-                        parsed["description"],
-                        parsed["tags"],
-                        parsed["content"],
-                    ))
+                # Insert into storage
+                cursor.execute("""
+                    INSERT INTO skills (name, category, description, tags, filepath, content, sections_json, mtime)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    parsed["name"],
+                    parsed["category"],
+                    parsed["description"],
+                    parsed["tags"],
+                    parsed["filepath"],
+                    parsed["content"],
+                    parsed["sections_json"],
+                    parsed["mtime"],
+                ))
 
-                    self._file_mtimes[fpath_str] = mtime
+                # Insert into FTS5 under the same rowid
+                cursor.execute("""
+                    INSERT INTO skills_fts (rowid, name, category, description, tags, content)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    cursor.lastrowid,
+                    parsed["name"],
+                    parsed["category"],
+                    parsed["description"],
+                    parsed["tags"],
+                    parsed["content"],
+                ))
 
             self.conn.commit()
 
@@ -302,47 +315,87 @@ class SkillIndexer:
             """)
             return [dict(row) for row in cursor.fetchall()]
 
+    @staticmethod
+    def _query_terms(query: str) -> List[str]:
+        """Split a query into unique terms. Combining marks stay attached, so Thai or Hindi words aren't cut apart."""
+        terms: List[str] = []
+        current: List[str] = []
+        for ch in query + " ":
+            if unicodedata.category(ch)[0] in "LNM":
+                current.append(ch)
+            elif current:
+                term = "".join(current)
+                if term.casefold() not in (t.casefold() for t in terms):
+                    terms.append(term)
+                current = []
+        return terms
+
+    @staticmethod
+    def _fts_expr(terms: List[str], operator: str) -> str:
+        """Quote each term so words like AND/NOT aren't parsed as operators; prefix-match terms of 3+ chars."""
+        return f" {operator} ".join(f'"{t}"*' if len(t) >= 3 else f'"{t}"' for t in terms)
+
+    def _fts_search(self, cursor: sqlite3.Cursor, fts_expr: str, limit: int) -> List[Dict[str, Any]]:
+        weights = ", ".join(str(w) for _, w in self.FIELD_WEIGHTS)
+        try:
+            cursor.execute(f"""
+                SELECT s.name, s.category, s.description, s.tags, s.sections_json,
+                       bm25(skills_fts, {weights}) as rank
+                FROM skills_fts
+                JOIN skills s ON skills_fts.rowid = s.rowid
+                WHERE skills_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+            """, (fts_expr, limit))
+        except sqlite3.OperationalError:
+            return []
+        return [dict(row) for row in cursor.fetchall()]
+
+    def _substring_search(self, cursor: sqlite3.Cursor, terms: List[str], limit: int) -> List[Dict[str, Any]]:
+        """Weighted substring match for text FTS5 can't split into words (Thai, CJK) or word fragments."""
+        folded_terms = [t.casefold() for t in terms]
+        cursor.execute("SELECT name, category, description, tags, sections_json, content FROM skills")
+        scored = []
+        for row in cursor.fetchall():
+            fields = {field: (row[field] or "").casefold() for field, _ in self.FIELD_WEIGHTS}
+            score = sum(
+                weight
+                for term in folded_terms
+                for field, weight in self.FIELD_WEIGHTS
+                if term in fields[field]
+            )
+            if score:
+                result = dict(row)
+                del result["content"]
+                result["rank"] = -score
+                scored.append(result)
+        scored.sort(key=lambda r: (r["rank"], r["name"]))
+        return scored[:limit]
+
     def search(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
         self.sync_index()
-        clean_query = query.strip()
-        if not clean_query:
+        terms = self._query_terms(query)
+        if not terms or limit <= 0:
             return []
-
-        # Sanitize query for FTS5
-        tokens = re.findall(r"[\w\d]+", clean_query)
-        if not tokens:
-            return []
-
-        # Construct FTS query with prefix matching on last token
-        fts_expr = " AND ".join(tokens[:-1] + [f"{tokens[-1]}*"]) if len(tokens) > 1 else f"{tokens[0]}*"
 
         with self._lock:
             cursor = self.conn.cursor()
-            try:
-                # Weighted search: name (10x), category (5x), description (5x), tags (8x), content (1x)
-                cursor.execute("""
-                    SELECT s.name, s.category, s.description, s.tags, s.sections_json,
-                           bm25(skills_fts, 10.0, 5.0, 5.0, 8.0, 1.0) as rank
-                    FROM skills_fts
-                    JOIN skills s ON skills_fts.name = s.name
-                    WHERE skills_fts MATCH ?
-                    ORDER BY rank
-                    LIMIT ?
-                """, (fts_expr, limit))
-                results = [dict(row) for row in cursor.fetchall()]
-            except Exception:
-                results = []
 
-            # Fallback to LIKE keyword search if FTS yielded no results
+            # Skills matching every term come first
+            results = self._fts_search(cursor, self._fts_expr(terms, "AND"), limit)
+
+            # Top up with skills matching only some of the terms
+            if len(results) < limit and len(terms) > 1:
+                seen = {r["name"] for r in results}
+                for row in self._fts_search(cursor, self._fts_expr(terms, "OR"), limit + len(results)):
+                    if len(results) >= limit:
+                        break
+                    if row["name"] not in seen:
+                        results.append(row)
+
+            # Fall back to substring matching if FTS found nothing
             if not results:
-                like_query = f"%{clean_query}%"
-                cursor.execute("""
-                    SELECT name, category, description, tags, sections_json, 99.0 as rank
-                    FROM skills
-                    WHERE name LIKE ? OR description LIKE ? OR tags LIKE ? OR content LIKE ?
-                    LIMIT ?
-                """, (like_query, like_query, like_query, like_query, limit))
-                results = [dict(row) for row in cursor.fetchall()]
+                results = self._substring_search(cursor, terms, limit)
 
             return results
 
@@ -433,6 +486,7 @@ def list_available_skills(
 @mcp.tool()
 def search_skills(query: str, limit: int = 5) -> str:
     """Search skills by keyword, tag, or topic using fast Full-Text Search (FTS5).
+    Skills matching all keywords are listed first, followed by skills matching only some of them.
 
     Args:
         query: Keywords to search (e.g., 'docker security', 'sql index', 'api rest')
@@ -540,16 +594,15 @@ def add_or_update_skill(
     # Split tags into clean list
     tag_list = [t.strip() for t in tags.split(",") if t.strip()]
 
-    # Format file with YAML frontmatter
-    file_content = f"""---
-name: {clean_name}
-category: {clean_cat}
-description: {description.strip()}
-tags: {json.dumps(tag_list)}
----
-
-{content.strip()}
-"""
+    # Format file with YAML frontmatter (safe_dump quotes values containing ':', '#', newlines, etc.)
+    frontmatter = yaml.safe_dump(
+        {"name": clean_name, "category": clean_cat, "description": description.strip(), "tags": tag_list},
+        allow_unicode=True,
+        sort_keys=False,
+        default_flow_style=None,
+        width=float("inf"),
+    )
+    file_content = f"---\n{frontmatter}---\n\n{content.strip()}\n"
 
     with open(target_file, "w", encoding="utf-8") as f:
         f.write(file_content)
@@ -557,7 +610,8 @@ tags: {json.dumps(tag_list)}
     # Trigger instant re-index
     indexer.sync_index()
 
-    return f"Skill '{clean_name}' successfully saved to '{target_file.relative_to(BASE_DIR)}' and indexed."
+    # SKILLS_DIR may live outside BASE_DIR (SKILLS_DIR env var), so report the path relative to it
+    return f"Skill '{clean_name}' successfully saved to '{target_file.relative_to(SKILLS_DIR).as_posix()}' in the skills directory and indexed."
 
 
 if __name__ == "__main__":

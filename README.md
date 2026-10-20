@@ -26,11 +26,17 @@ However, preloading dozens of skill documents into the system prompt causes seve
 
 **Skills Hub MCP** changes the paradigm: instead of stuffing all skills into the prompt upfront, skills are stored locally as Markdown files and retrieved **only when needed, on-demand**:
 
-1. **Lightweight Overview**: AI inspects a compact category summary (`list_available_skills`) costing less than **100 tokens**.
-2. **Sub-millisecond Search**: Powered by in-memory **SQLite FTS5 (Full-Text Search)** and **BM25 ranking**, searching keywords and tags in `< 5ms`.
-3. **Section-Targeted Retrieval**: Fetch only actionable sections (`get_skill(name, section="checklist")`) rather than 300 lines of prose — **reducing token consumption by 85–95%**.
-4. **Built-in Token Directives**: Every retrieved skill automatically injects a strict directive instructing the AI to summarize actionable steps into its scratchpad instead of echoing the full document back to the user.
-5. **Dynamic Hot-Reloading**: Drop new Markdown files into the `skills/` folder; the server instantly detects and re-indexes them without requiring a restart.
+1. **Lightweight Overview**: `list_available_skills` returns a compact index (about 300 tokens for the 6 starter skills, about 150 with `summary_only=True`). Above 25 skills it automatically collapses to one line per category.
+2. **Fast Search**: In-memory **SQLite FTS5 (Full-Text Search)** with **BM25 ranking** — about 0.5 ms per query on the starter skills, including the change scan. Skills matching every keyword are listed first, followed by partial matches. A substring fallback covers languages written without spaces between words, such as Thai.
+3. **Section-Targeted Retrieval**: Fetch only the section you need (`get_skill(name, section="checklist")`) instead of the whole document. Savings grow with skill length: the starter skills are short, so a checklist response is only about 20% smaller than the full skill, while long runbooks save far more.
+4. **Token-Saving Directive**: Every `get_skill` response starts with a short directive (about 110 tokens) asking the agent not to echo the document back. This only saves output tokens — the retrieved text still enters the context, which is why section-targeted retrieval matters most.
+5. **Hot-Reloading**: Every tool call re-scans the `skills/` folder and re-indexes only files that were added, changed, or deleted. No restart and no background watcher needed.
+
+### Where Skills Hub Fits
+
+Claude Code already has native [Agent Skills](https://code.claude.com/docs/en/skills) with the same progressive loading built in. Skills Hub's main value is **one skill library shared by every agent** (Claude Code, Cursor, Antigravity/Gemini, Cline, Windsurf), kept as plain Markdown in one place.
+
+Agents only use the hub when they decide to call it, so the [directive files](#-universal-agent-directives) matter: they tell the agent to search the hub before working in a specialized domain.
 
 ---
 
@@ -41,15 +47,15 @@ flowchart TD
     User([User Request]) --> Agent[AI Coding Agent<br>Antigravity / Claude / Cursor]
     
     subgraph "Context Window Savings"
-        Agent -- "1. list_available_skills() (~80 tokens)" --> Hub[Skills Hub MCP Server<br>FastMCP + stdio]
-        Agent -- "2. search_skills('docker non-root') (~120 tokens)" --> Hub
-        Agent -- "3. get_skill('docker-deployment', section='checklist') (~90 tokens)" --> Hub
+        Agent -- "1. list_available_skills() (~300 tokens)" --> Hub[Skills Hub MCP Server<br>FastMCP + stdio]
+        Agent -- "2. search_skills('docker non-root') (~90 tokens)" --> Hub
+        Agent -- "3. get_skill('docker-deployment', section='checklist') (~280 tokens)" --> Hub
     end
 
     subgraph "Skills Hub Core Engine"
         Hub --> FTS5[(SQLite In-Memory FTS5<br>BM25 Weighted Search)]
-        Hub --> Watcher[Dynamic Hot-Reload Watcher]
-        Watcher --> Storage[skills/ Directory<br>Markdown + YAML Frontmatter]
+        Hub --> Scan[Change Scan on Every Call<br>mtime check]
+        Scan --> Storage[skills/ Directory<br>Markdown + YAML Frontmatter]
     end
 
     Hub -- "Targeted Checklist + Token-Saving Directive" --> Agent
@@ -63,13 +69,15 @@ flowchart TD
 ```
 MCP-hub-Skill/
 ├── server.py                   # FastMCP Server (stdio) with SQLite FTS5 Engine
-├── config.json                 # Configuration (skills path, search limits)
-├── mcp_config_snippet.json     # Ready-to-use config snippet for MCP clients
+├── config.json                 # Configuration (skills directory)
+├── mcp_config_snippet.json     # Example MCP client config (edit the paths for your machine)
 ├── AGENTS.md                   # Universal Directive for all AI Agents
 ├── CLAUDE.md                   # Directive for Claude Code
+├── GEMINI.md                   # Directive for Antigravity / Gemini
 ├── .cursorrules                # Directive for Cursor IDE
 ├── pyproject.toml              # Python project metadata
 ├── requirements.txt            # Dependencies (fastmcp, pyyaml)
+├── LICENSE                     # MIT License
 │
 ├── skills/                     # Default Starter Skills
 │   ├── web-development/api-design.md           (REST API Best Practices)
@@ -92,7 +100,7 @@ MCP-hub-Skill/
 | `list_available_skills` | Returns a compact overview of available skills grouped by category. Automatically summarizes when skill count exceeds 25. | `category` (optional), `limit` (default: 30), `summary_only` (default: false) |
 | `search_skills` | Fast BM25 full-text search across titles, descriptions, tags, and content. Returns ranked results with section lists. | `query` (required), `limit` (default: 5) |
 | `get_skill` | Retrieves complete skill instructions or extracts targeted sub-sections (e.g., `checklist`, `anti-patterns`) with token directives. | `skill_name` (required), `section` (optional) |
-| `add_or_update_skill` | Programmatically creates or updates a skill in the repository with automatic indexing and path traversal protection. | `name`, `description`, `content`, `category`, `tags` |
+| `add_or_update_skill` | Creates a skill, or overwrites the existing one with the same name and category, then re-indexes it. Names and categories are limited to letters, digits, `_` and `-`, which blocks path traversal. | `name`, `description`, `content`, `category`, `tags` |
 
 ---
 
@@ -219,26 +227,36 @@ To ensure your AI assistant retrieves skills on demand rather than asking you to
 | :--- | :--- | :--- |
 | **`AGENTS.md`** ⭐ | **Antigravity, Cline, Roo Code, Open Agents** | Vendor-neutral universal standard. First-class citizen in modern agentic tools. |
 | **`CLAUDE.md`** | **Claude Code (Anthropic)** | Standard configuration for Claude Code CLI. |
+| **`GEMINI.md`** | **Antigravity / Gemini** | Same rules as `AGENTS.md`, for tools that read `GEMINI.md`. |
 | **`.cursorrules`** | **Cursor IDE** | Automatically triggers for Cursor Composer and Chat. |
 
 ---
 
-## 📊 Token Savings Benchmark
+## 📊 Token Usage (Measured)
 
-| Operation | Traditional System Prompt Injection | Skills Hub Progressive Retrieval | Token Reduction |
-| :--- | :--- | :--- | :--- |
-| **Session Initialization** | 15,000 – 45,000 tokens (All skills preloaded) | **~80 tokens** (`list_available_skills`) | **~99.5% saved** |
-| **Skill Search** | N/A (Manual searching required) | **~120 tokens** (`search_skills`) | **Fast & Focused** |
-| **Applying a Rule/Checklist** | 1,200 – 3,500 tokens (Full doc copy) | **~90 tokens** (`get_skill(..., section='checklist')`) | **~95% saved** |
+Measured on the 6 bundled starter skills. Tokens are estimated at ~4 characters per token, so treat them as approximate. `get_skill` figures include the ~110-token directive.
+
+| Operation | Tokens (≈) |
+| :--- | :--- |
+| Preloading all 6 skills into the system prompt | ~1,550 |
+| `list_available_skills()` | ~300 |
+| `list_available_skills(summary_only=True)` | ~150 |
+| `search_skills('docker non-root')` | ~90 |
+| `get_skill('docker-deployment')` (full skill) | ~355 |
+| `get_skill('docker-deployment', section='checklist')` | ~280 |
+| MCP tool definitions (loaded once per session) | ~650 |
+
+Preloading costs grow with every skill you add. The hub's overview stays small (one line per category above 25 skills), and search and retrieval only cost tokens for the skills you actually use. With just a few short skills, preloading can be cheaper than the hub's tool definitions; the hub pays off as the library grows.
 
 ---
 
 ## 🛡️ Hardening & Thread Safety
 
-- **Thread-Safe In-Memory SQLite**: Protected by `threading.Lock()` mutex to guarantee zero race conditions or database locks during concurrent tool calls.
-- **Path Traversal Protection**: File inputs are sanitized using strict alphanumeric regex filters, preventing directory escape attacks (`../../`).
+- **Thread-Safe In-Memory SQLite**: All index reads and writes go through a single `threading.Lock()`, so concurrent tool calls never see a half-updated index.
+- **Path Traversal Protection**: Skill names and categories are restricted to letters, digits, `_` and `-`, so they cannot escape the skills directory (`../../`).
+- **Safe Frontmatter**: Skills written by the server or the importer use a YAML serializer, so descriptions containing `:`, `#`, or line breaks stay valid.
 - **Hidden Directory Filtering**: Automatically ignores `.git`, `.obsidian`, `.vscode`, and hidden files.
-- **Name Collision Disambiguation**: Gracefully namespaces duplicate skill names across multiple directories (`category/skill-name`).
+- **Name Collision Disambiguation**: Duplicate skill names are namespaced as `category/skill-name` (or by the file's path if that is also taken).
 
 ---
 
