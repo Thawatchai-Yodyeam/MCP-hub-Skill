@@ -239,6 +239,9 @@ To ensure your AI assistant retrieves skills on demand rather than asking you to
 - **Path Traversal Protection**: File inputs are sanitized using strict alphanumeric regex filters, preventing directory escape attacks (`../../`).
 - **Hidden Directory Filtering**: Automatically ignores `.git`, `.obsidian`, `.vscode`, and hidden files.
 - **Name Collision Disambiguation**: Gracefully namespaces duplicate skill names across multiple directories (`category/skill-name`).
+- **Safe Frontmatter Writes**: `add_or_update_skill` and the importer serialize frontmatter with `yaml.safe_dump`, so descriptions containing `:` or `#` always round-trip. Updating an existing skill edits its file in place instead of creating a duplicate.
+- **Robust Search**: Query tokens are quoted before reaching FTS5 (so words like `AND`/`NOT` or stray quotes can't break a search), multi-word queries relax from all-terms to any-term, and `##` lines inside code fences are not treated as sections.
+- **Read-Only Tool Annotations**: `list_available_skills`, `search_skills`, and `get_skill` are marked `readOnlyHint`, so MCP clients can auto-approve them.
 
 ---
 

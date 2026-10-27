@@ -8,9 +8,7 @@ Usage:
     python scripts/import_skills.py "C:\\path\\to\\custom\\skills"
 """
 
-import os
 import re
-import shutil
 import sys
 from pathlib import Path
 import yaml
@@ -32,12 +30,12 @@ DEFAULT_SEARCH_PATHS = [
 
 
 def parse_frontmatter(content: str):
-    fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)$", content, re.DOTALL)
+    fm_match = re.match(r"^---[ \t]*\n(.*?)\n---[ \t]*(?:\n(.*))?$", content, re.DOTALL)
     if fm_match:
         try:
             fm = yaml.safe_load(fm_match.group(1))
-            return fm if isinstance(fm, dict) else {}, fm_match.group(2).strip()
-        except Exception:
+            return fm if isinstance(fm, dict) else {}, (fm_match.group(2) or "").strip()
+        except yaml.YAMLError:
             pass
     return {}, content.strip()
 
@@ -58,6 +56,8 @@ def import_skill_file(source_file: Path, category_override: str = None):
         return False
 
     category = category_override or fm.get("category") or "imported"
+    # Sanitize like the server does, so a frontmatter category can't escape the skills dir
+    category = re.sub(r"[^\w\-]", "", str(category).lower().strip()) or "imported"
     description = fm.get("description", "")
     if not description or str(description).strip() in ["---", ""]:
         for line in body.splitlines():
@@ -74,15 +74,18 @@ def import_skill_file(source_file: Path, category_override: str = None):
     target_dir.mkdir(parents=True, exist_ok=True)
     target_file = target_dir / f"{skill_name}.md"
 
-    new_file_content = f"""---
-name: {skill_name}
-category: {category}
-description: {str(description).strip()}
-tags: {tags}
----
-
-{body}
-"""
+    frontmatter = yaml.safe_dump(
+        {
+            "name": skill_name,
+            "category": category,
+            "description": " ".join(str(description).split()),
+            "tags": [str(t) for t in tags] if isinstance(tags, list) else [str(tags)],
+        },
+        allow_unicode=True,
+        sort_keys=False,
+        default_flow_style=None,
+    )
+    new_file_content = f"---\n{frontmatter}---\n\n{body}\n"
     with open(target_file, "w", encoding="utf-8") as f:
         f.write(new_file_content)
 
